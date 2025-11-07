@@ -127,7 +127,7 @@ if __name__ == "__main__":
 
 
         naive_temp_output = hf_model.generate(input_ids, max_new_tokens=3072, 
-                                return_dict_in_generate=True, output_scores=True, temperature = temp)
+                                return_dict_in_generate=True, output_scores=True, do_sample = True, temperature = temp)
         
         print(tokenizer.decode(naive_temp_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
         print("naive done")
