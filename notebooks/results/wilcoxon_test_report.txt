@@ -1,0 +1,95 @@
+
+================================================================================
+WILCOXON SIGNED RANK TEST: MCMC vs STANDARD SAMPLING
+COMPREHENSIVE STATISTICAL ANALYSIS REPORT
+================================================================================
+
+1. EXPERIMENT CONFIGURATION
+--------------------------------------------------------------------------------
+Model: qwen_math (Qwen/Qwen2.5-Math-7B)
+Dataset: MATH500
+Questions analyzed: 20
+Temperature: 0.25
+MCMC steps: 10
+Significance level (α): 0.05
+
+2. DESCRIPTIVE STATISTICS
+--------------------------------------------------------------------------------
+Standard Sampling:
+  Mean cumulative log-prob: -148.2475 ± 215.0490
+  Mean tokens: 608.30
+  Accuracy: 45.00% (9/20)
+
+MCMC Sampling:
+  Mean cumulative log-prob: -88.6324 ± 58.0246
+  Mean tokens: 533.95
+  Accuracy: 70.00% (14/20)
+  Mean acceptance ratio: 0.5557
+
+Difference (MCMC - Standard):
+  Mean difference: 59.6151
+  Median difference: -4.4981
+  Std difference: 188.6667
+
+3. WILCOXON SIGNED RANK TEST RESULTS
+--------------------------------------------------------------------------------
+Two-tailed test:
+  H₀: median(MCMC - Standard) = 0
+  H₁: median(MCMC - Standard) ≠ 0
+
+  Test statistic (W): 97.0000
+  p-value: 0.784126
+  Decision: FAIL TO REJECT H₀
+
+  Effect size (rank-biserial r): 0.0762
+  Interpretation: Negligible
+
+One-tailed test (MCMC > Standard):
+  p-value: 0.392063
+  Decision: FAIL TO REJECT H₀
+
+4. PAIRED T-TEST (PARAMETRIC COMPARISON)
+--------------------------------------------------------------------------------
+  t-statistic: 1.4131
+  p-value: 0.173797
+  Decision: FAIL TO REJECT H₀
+
+  Cohen's d: 0.3160
+  Interpretation: Small
+
+5. NORMALITY ASSESSMENT
+--------------------------------------------------------------------------------
+Shapiro-Wilk test:
+  Test statistic: 0.5972
+  p-value: 0.0000
+  Conclusion: Non-normal distribution (Wilcoxon preferred)
+
+6. POWER ANALYSIS
+--------------------------------------------------------------------------------
+Type I Error Simulation:
+  Nominal α: 0.050
+  Simulated Type I error: 0.048
+  Status: ✓ Matches nominal α
+
+Statistical Power:
+  Sample size: n = 20
+  Observed effect size: d = 0.316
+  Minimum detectable effect (80% power): d ≈ 1.000
+
+  Study power assessment: ⚠ May be underpowered
+
+7. CONCLUSIONS
+--------------------------------------------------------------------------------
+Based on the Wilcoxon signed rank test with 20 paired observations:
+
+• Statistical Significance: No significant difference detected (p ≥ α)
+• Effect Size: 0.076 (negligible)
+• Practical Significance: Mean log-prob improvement of 59.6151
+• Accuracy Impact: MCMC shows higher accuracy
+
+Recommendation:
+No significant difference between methods. Choice may depend on computational cost vs. benefit.
+
+================================================================================
+END OF REPORT
+================================================================================
