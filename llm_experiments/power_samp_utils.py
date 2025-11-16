@@ -225,11 +225,21 @@ class SoftThinkingSampler:
 
     Instead of sampling discrete tokens, creates soft tokens as probability-weighted
     mixtures of token embeddings: h_t = Σ_v p(v|context) * embedding(v)
+
+    Enhanced with:
+    - Noise injection (Dirichlet, Gumbel-Softmax) for exploration
+    - Dual temperature control (thinking vs output)
+    - Multi-criteria early stopping (entropy + length)
     """
     def __init__(self, model, tokenizer, device,
                  max_topk=10, min_p=0.001,
                  early_stopping_entropy_threshold=0.05,
-                 temperature=1.0):
+                 early_stopping_length_threshold=None,
+                 thinking_temperature=1.0,
+                 output_temperature=1.0,
+                 noise_type='none',  # 'none', 'dirichlet', 'gumbel'
+                 noise_alpha=0.1,  # For Dirichlet noise
+                 gumbel_tau=1.0):  # For Gumbel-Softmax temperature
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -239,7 +249,14 @@ class SoftThinkingSampler:
         self.max_topk = max_topk  # Top-k tokens to consider for soft token
         self.min_p = min_p  # Minimum probability threshold
         self.early_stopping_entropy_threshold = early_stopping_entropy_threshold
-        self.temperature = temperature
+        self.early_stopping_length_threshold = early_stopping_length_threshold  # Max thinking steps
+        self.thinking_temperature = thinking_temperature  # Temperature during thinking
+        self.output_temperature = output_temperature  # Temperature for final output
+
+        # Noise injection parameters
+        self.noise_type = noise_type
+        self.noise_alpha = noise_alpha  # Dirichlet concentration parameter
+        self.gumbel_tau = gumbel_tau  # Gumbel-Softmax temperature
 
         # Get embedding layer
         if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
@@ -254,13 +271,57 @@ class SoftThinkingSampler:
         else:
             raise ValueError("Could not find embedding layer in model")
 
+    def apply_noise_to_probs(self, probs):
+        """
+        Apply noise to probabilities for exploration.
+
+        Args:
+            probs: Probability distribution tensor
+
+        Returns:
+            Perturbed probability distribution
+        """
+        if self.noise_type == 'none':
+            return probs
+
+        elif self.noise_type == 'dirichlet':
+            # Dirichlet noise: sample from Dirichlet(alpha * probs)
+            # This maintains the general shape but adds stochasticity
+            alpha = torch.ones_like(probs) * self.noise_alpha
+            concentration = alpha + probs * (1 - self.noise_alpha)
+
+            # Sample from Dirichlet distribution
+            dirichlet = torch.distributions.Dirichlet(concentration)
+            perturbed_probs = dirichlet.sample()
+
+            # Renormalize
+            perturbed_probs = perturbed_probs / perturbed_probs.sum()
+            return perturbed_probs
+
+        elif self.noise_type == 'gumbel':
+            # Gumbel-Softmax: add Gumbel noise to logits before softmax
+            # This is a reparameterization trick for categorical sampling
+            logits = torch.log(probs + 1e-10)
+
+            # Sample Gumbel noise
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
+
+            # Apply Gumbel-Softmax
+            perturbed_logits = (logits + gumbel_noise) / self.gumbel_tau
+            perturbed_probs = F.softmax(perturbed_logits, dim=-1)
+            return perturbed_probs
+
+        else:
+            raise ValueError(f"Unknown noise type: {self.noise_type}")
+
     @torch.no_grad()
-    def create_soft_token(self, prefix):
+    def create_soft_token(self, prefix, use_thinking_temp=True):
         """
         Create a soft token as probability-weighted mixture of token embeddings.
 
         Args:
             prefix: List of token IDs representing the context
+            use_thinking_temp: Whether to use thinking temperature (True) or output temperature (False)
 
         Returns:
             soft_embedding: Tensor of shape (1, 1, hidden_dim) representing soft token
@@ -278,11 +339,16 @@ class SoftThinkingSampler:
         output = self.model(prefix_cond)
         logits = output.logits[0, -1, :]  # Shape: (vocab_size,)
 
-        # Apply temperature scaling
-        logits = logits / self.temperature
+        # Apply temperature scaling (different for thinking vs output)
+        temperature = self.thinking_temperature if use_thinking_temp else self.output_temperature
+        logits = logits / temperature
 
         # Get probabilities
         probs = F.softmax(logits, dim=-1)
+
+        # Apply noise injection for exploration (only during thinking phase)
+        if use_thinking_temp and self.noise_type != 'none':
+            probs = self.apply_noise_to_probs(probs)
 
         # Calculate entropy for early stopping
         entropy = -(probs * torch.log(probs + 1e-10)).sum()
@@ -309,7 +375,7 @@ class SoftThinkingSampler:
     @torch.no_grad()
     def generate_with_soft_thinking(self, prefix, max_new_tokens, num_thinking_steps=3):
         """
-        Generate tokens using soft thinking.
+        Generate tokens using soft thinking with enhanced early stopping.
 
         Args:
             prefix: Initial context (list of token IDs)
@@ -335,8 +401,10 @@ class SoftThinkingSampler:
 
             for thinking_step in range(num_thinking_steps):
                 if thinking_step == 0:
-                    # First step: use discrete prefix
-                    soft_emb, log_probs, top_tokens, entropy = self.create_soft_token(current_prefix)
+                    # First step: use discrete prefix with thinking temperature
+                    soft_emb, log_probs, top_tokens, entropy = self.create_soft_token(
+                        current_prefix, use_thinking_temp=True
+                    )
                 else:
                     # Subsequent steps: use soft embeddings
                     soft_emb, log_probs, top_tokens, entropy = self.create_soft_token_from_soft(
@@ -346,13 +414,21 @@ class SoftThinkingSampler:
                 soft_embeddings_list.append(soft_emb)
                 entropies.append(entropy)
 
-                # Early stopping if entropy is low (high confidence)
+                # Multi-criteria early stopping
+                # 1. Entropy-based: stop if model is highly confident
                 if entropy < self.early_stopping_entropy_threshold:
                     break
 
-            # Commit to hard token: use final soft embedding to get token
+                # 2. Length-based: stop if reached max thinking steps
+                if self.early_stopping_length_threshold is not None:
+                    if len(soft_embeddings_list) >= self.early_stopping_length_threshold:
+                        break
+
+            # Commit to hard token: use final soft embedding with output temperature
             final_soft_emb = soft_embeddings_list[-1]
-            final_token, final_log_prob = self.commit_to_hard_token(current_prefix, final_soft_emb)
+            final_token, final_log_prob = self.commit_to_hard_token(
+                current_prefix, final_soft_emb, use_thinking_temp=False
+            )
 
             generated_tokens.append(final_token)
             all_log_probs.append(final_log_prob)
@@ -361,7 +437,10 @@ class SoftThinkingSampler:
             soft_token_info.append({
                 'thinking_steps': len(soft_embeddings_list),
                 'entropies': entropies,
-                'final_entropy': entropies[-1]
+                'final_entropy': entropies[-1],
+                'stopped_by': 'entropy' if entropies[-1] < self.early_stopping_entropy_threshold else
+                              'length' if (self.early_stopping_length_threshold and len(soft_embeddings_list) >= self.early_stopping_length_threshold) else
+                              'max_steps'
             })
 
             # Check for EOS
@@ -399,9 +478,13 @@ class SoftThinkingSampler:
         output = self.model(inputs_embeds=all_embeddings)
         logits = output.logits[0, -1, :]
 
-        # Apply temperature
-        logits = logits / self.temperature
+        # Apply thinking temperature
+        logits = logits / self.thinking_temperature
         probs = F.softmax(logits, dim=-1)
+
+        # Apply noise injection during thinking
+        if self.noise_type != 'none':
+            probs = self.apply_noise_to_probs(probs)
 
         # Calculate entropy
         entropy = -(probs * torch.log(probs + 1e-10)).sum()
@@ -419,13 +502,14 @@ class SoftThinkingSampler:
         return soft_embedding, log_probs, topk_indices, entropy.item()
 
     @torch.no_grad()
-    def commit_to_hard_token(self, discrete_prefix, final_soft_embedding):
+    def commit_to_hard_token(self, discrete_prefix, final_soft_embedding, use_thinking_temp=False):
         """
         Commit soft thinking to a hard token.
 
         Args:
             discrete_prefix: List of discrete token IDs
             final_soft_embedding: Final soft embedding from thinking process
+            use_thinking_temp: Whether to use thinking temperature (typically False for final output)
 
         Returns:
             token_id: Selected hard token
@@ -448,8 +532,11 @@ class SoftThinkingSampler:
         output = self.model(inputs_embeds=all_embeddings)
         logits = output.logits[0, -1, :]
 
+        # Use output temperature for final token selection (sharper/more confident)
+        temperature = self.thinking_temperature if use_thinking_temp else self.output_temperature
+
         # Sample token
-        probs = F.softmax(logits / self.temperature, dim=-1)
+        probs = F.softmax(logits / temperature, dim=-1)
         token_id = torch.multinomial(probs, num_samples=1).item()
         log_prob = torch.log(probs[token_id] + 1e-10).item()
 
